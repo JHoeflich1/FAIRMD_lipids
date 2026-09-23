@@ -41,6 +41,7 @@ dependencies = [
     "periodictable>=1.5.0",
     "Deprecated",
     "requests",
+    "libarchive-c>=5",
     "scipy",
     "jsonschema",
     "natsort",

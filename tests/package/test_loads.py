@@ -6,6 +6,7 @@ NOTE: globally import of fairmd-lipids is **STRICTLY FORBIDDEN** because it
 """
 
 import hashlib
+import io
 import os
 import requests
 import responses
@@ -13,6 +14,7 @@ from responses import matchers
 from unittest import mock
 import sys
 import time
+import zipfile
 
 import pytest
 import pytest_check as check
@@ -364,10 +366,15 @@ class TestResolveFileUrl:
             "https://zenodo.org/records/8435a/files/a.txt",
         )
         time.sleep(5)
-        # non-zenodo DOI fails
-        with check.raises(NotImplementedError) as e:
-            dio.resolve_file_url("10.1000/xyz123", "a.txt", validate_uri=False)
-        check.is_in("Repository not validated", str(e.value))
+
+    @pytest.mark.parametrize("validate_uri", [True, False])
+    @responses.activate
+    def test_unsupported_repository_is_rejected_without_network(self, validate_uri):
+        import fairmd.lipids.databankio as dio
+
+        with pytest.raises(NotImplementedError, match="Repository not supported"):
+            dio.resolve_file_url("10.17617/3.ABC", "data.zip/run.xtc", validate_uri=validate_uri)
+        assert len(responses.calls) == 0
 
     def test_goodDOI(self):
         import fairmd.lipids.databankio as dio
@@ -404,6 +411,160 @@ class TestResolveFileUrl:
             dio.resolve_file_url("10.5281/zenodo.8435138", "a.txt", validate_uri=True)
 
             assert len(responses.calls) == min(10, len(statuses))
+
+
+def _zip_bytes(entries: dict) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+    return buf.getvalue()
+
+
+class TestZipArchiveSupport:
+    """ZIP extraction and cache reuse."""
+
+    @responses.activate
+    def test_extracts_member_from_downloaded_archive(self, tmp_path):
+        import fairmd.lipids.databankio as dio
+
+        payload = _zip_bytes({"folder/run.xtc": b"trajectory-bytes"})
+        url = "https://example.org/data.zip"
+        responses.add(responses.GET, url, status=200, body=payload, headers={"Content-Length": str(len(payload))})
+
+        dest = os.path.join(str(tmp_path), "run.xtc")
+        dio.download_resource_from_uri(url, dest, source_path="data.zip/folder/run.xtc")
+
+        assert open(dest, "rb").read() == b"trajectory-bytes"
+        assert len(list((tmp_path / ".archives").rglob("data.zip"))) == 1
+
+    @responses.activate
+    def test_two_members_share_one_archive_download(self, tmp_path):
+        import fairmd.lipids.databankio as dio
+
+        payload = _zip_bytes({"run.xtc": b"traj-bytes", "run.tpr": b"topo-bytes"})
+        url = "https://example.org/data.zip"
+        responses.add(responses.GET, url, status=200, body=payload, headers={"Content-Length": str(len(payload))})
+
+        dio.download_resource_from_uri(
+            url,
+            os.path.join(str(tmp_path), "run.xtc"),
+            source_path="data.zip/run.xtc",
+        )
+        dio.download_resource_from_uri(
+            url,
+            os.path.join(str(tmp_path), "run.tpr"),
+            source_path="data.zip/run.tpr",
+        )
+
+        assert open(os.path.join(str(tmp_path), "run.xtc"), "rb").read() == b"traj-bytes"
+        assert open(os.path.join(str(tmp_path), "run.tpr"), "rb").read() == b"topo-bytes"
+        # Two size checks and one archive download.
+        assert len(responses.calls) == 3
+
+    def test_missing_member_raises_file_not_found(self, tmp_path):
+        import fairmd.lipids.databankio as dio
+
+        archive = tmp_path / "data.zip"
+        archive.write_bytes(_zip_bytes({"present.xtc": b"x"}))
+
+        with pytest.raises(FileNotFoundError):
+            dio._extract_zip_member(str(archive), "absent.xtc", str(tmp_path / "out.xtc"))
+
+    def test_symlink_member_is_rejected_not_followed(self, tmp_path):
+        import fairmd.lipids.databankio as dio
+
+        archive = tmp_path / "data.zip"
+        with zipfile.ZipFile(archive, "w") as z:
+            info = zipfile.ZipInfo("link.xtc")
+            info.create_system = 3  # Unix
+            info.external_attr = 0o120777 << 16  # S_IFLNK
+            z.writestr(info, "/etc/passwd")
+
+        with pytest.raises(ValueError, match="regular file"):
+            dio._extract_zip_member(str(archive), "link.xtc", str(tmp_path / "out.xtc"))
+
+    @pytest.mark.parametrize("member", ["../escape.xtc", "/absolute.xtc"])
+    def test_path_traversal_is_rejected(self, tmp_path, member):
+        import fairmd.lipids.databankio as dio
+
+        archive = tmp_path / "data.zip"
+        archive.write_bytes(_zip_bytes({"present.xtc": b"x"}))
+
+        with pytest.raises(ValueError, match="Invalid archive member path"):
+            dio._extract_zip_member(str(archive), member, str(tmp_path / "out.xtc"))
+
+
+class TestPrepareFileSources:
+    def test_archived_entry_is_normalized_to_its_basename(self):
+        import fairmd.lipids.databankio as dio
+
+        sim = {"TRJ": [["data.zip/folder/run.xtc"]], "TPR": [["run.tpr"]]}
+
+        sources = dio.prepare_file_sources(sim, ["TRJ", "TPR"])
+
+        assert sources == {"run.xtc": "data.zip/folder/run.xtc", "run.tpr": "run.tpr"}
+        assert sim["TRJ"] == [["run.xtc"]], "the field itself must end up holding the plain local name"
+        assert sim["SOURCE_FILES"] == {"run.xtc": "data.zip/folder/run.xtc"}, (
+            "only the archived entry needs recording -- run.tpr is already fully addressed by its bare name"
+        )
+
+    def test_plain_repository_files_get_no_source_files_entry(self):
+        import fairmd.lipids.databankio as dio
+
+        sim = {"TRJ": [["run.xtc"]], "TPR": [["run.tpr"]]}
+
+        dio.prepare_file_sources(sim, ["TRJ", "TPR"])
+
+        assert "SOURCE_FILES" not in sim
+
+    def test_two_files_colliding_on_local_name_are_rejected(self):
+        import fairmd.lipids.databankio as dio
+
+        sim = {"TRJ": [["one.zip/run.xtc"], ["two.zip/run.xtc"]]}
+
+        with pytest.raises(ValueError, match="share local filename"):
+            dio.prepare_file_sources(sim, ["TRJ"])
+
+    def test_any_multi_segment_path_is_treated_as_archived_not_just_dot_zip(self):
+        """Path normalization does not depend on the archive extension."""
+        import fairmd.lipids.databankio as dio
+
+        sim = {"TRJ": [["nested/folder/run.xtc"]]}
+
+        sources = dio.prepare_file_sources(sim, ["TRJ"])
+
+        assert sources == {"run.xtc": "nested/folder/run.xtc"}
+        assert sim["SOURCE_FILES"] == {"run.xtc": "nested/folder/run.xtc"}
+
+
+class TestDownloadSystemFile:
+    @pytest.mark.parametrize("archived", [False, True])
+    @responses.activate
+    def test_redownload_from_saved_metadata(self, tmp_path, archived):
+        """Saved metadata supports archived files and legacy standalone files."""
+        import yaml
+        import fairmd.lipids.databankio as dio
+
+        source = "simulation.zip/replica1/run.xtc" if archived else "run.xtc"
+        repository_file = source.split("/")[0]
+        payload = _zip_bytes({"replica1/run.xtc": b"trajectory"}) if archived else b"trajectory"
+        responses.add(responses.GET, "https://zenodo.org/api/records/123",
+                      json={"files": [{"key": repository_file}]})
+        responses.add(responses.GET, f"https://zenodo.org/records/123/files/{repository_file}",
+                      body=payload, headers={"Content-Length": str(len(payload))})
+        sim = {"DOI": "10.5281/zenodo.123", "TRJ": [[source]]}
+        dio.prepare_file_sources(sim, ["TRJ"])
+        readme = tmp_path / "README.yaml"
+        readme.write_text(yaml.safe_dump(sim))
+        del sim
+
+        saved = yaml.safe_load(readme.read_text())
+        assert saved["TRJ"] == [["run.xtc"]]
+        assert ("SOURCE_FILES" in saved) == archived
+        dest = tmp_path / "run.xtc"
+        dio.download_system_file(saved, "run.xtc", str(dest))
+        assert dest.read_bytes() == b"trajectory"
 
 
 class TestCalcFileSha1Hash:

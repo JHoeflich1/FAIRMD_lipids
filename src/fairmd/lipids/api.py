@@ -35,7 +35,7 @@ import numpy as np
 from fairmd.lipids import FMDL_SIMU_PATH
 from fairmd.lipids.auxiliary import block_average_time_series
 from fairmd.lipids.core import System
-from fairmd.lipids.databankio import download_resource_from_uri, resolve_file_url
+from fairmd.lipids.databankio import download_system_file
 from fairmd.lipids.molecules import Molecule, lipids_set
 from fairmd.lipids.schema_validation.engines import get_struc_top_traj_fnames
 
@@ -368,8 +368,7 @@ class UniverseConstructor:
             if os.path.isfile(fpath):
                 # do not download if exists
                 return fpath
-            url = resolve_file_url(self._s["DOI"], fname)
-            _ = download_resource_from_uri(url, fpath, max_restarts=5)
+            download_system_file(self._s, fname, fpath, max_restarts=5)
             return fpath
 
         if struc is not None:

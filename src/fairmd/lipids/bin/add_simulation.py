@@ -54,6 +54,7 @@ from fairmd.lipids.databankio import (
     calc_file_sha1_hash,
     create_simulation_directories,
     download_resource_from_uri,
+    prepare_file_sources,
     resolve_file_url,
 )
 from fairmd.lipids.molecules import Lipid, MoleculeMappingError, NonLipid, lipids_set, solubles_set
@@ -159,7 +160,7 @@ Returns error codes:
 
     # validate yaml entries and return updated sim dict
     try:
-        sim_dict, files = parse_valid_config_settings(info_yaml, logger)
+        sim_dict, _files = parse_valid_config_settings(info_yaml, logger)
     except KeyError:
         logger.exception("Missing entry key in yaml config, aborting..")
         sys.exit(1)
@@ -203,23 +204,27 @@ Returns error codes:
 
     # Check link status and download files
     try:
-        download_links = []
-        for fi in files:
-            logger.info(f"Validating URL to file: {fi}..")
-            _x = resolve_file_url(sim["DOI"], fi, validate_uri=True)
-            download_links.append(_x)
+        # Preserve repository paths while normalizing local filenames.
+        file_keys = [k for k, v in software_dict[sim["SOFTWARE"].upper()].items() if "file" in v.get("TYPE", "")]
+        sources = prepare_file_sources(sim, file_keys)
 
-        logger.info(f"Now downloading {len(files)} files ...")
+        download_links = {}
+        for local, source in sources.items():
+            logger.info(f"Validating URL to file: {source}..")
+            download_links[local] = resolve_file_url(sim["DOI"], source, validate_uri=True)
 
-        for url, fi in zip(download_links, files, strict=False):
+        logger.info(f"Now downloading {len(sources)} files ...")
+
+        for local, source in sources.items():
             download_resource_from_uri(
-                url,
-                os.path.join(dir_tmp, fi),
+                download_links[local],
+                os.path.join(dir_tmp, local),
                 override_if_exists=args.no_cache,
                 max_bytes=args.dry_run,
+                source_path=source if source != local else None,
             )
 
-        logger.info(f"Download of {len(files)} files was successful")
+        logger.info(f"Download of {len(sources)} files was successful")
 
     except HTTPError as e:
         if e.code == 404:
@@ -260,7 +265,7 @@ Returns error codes:
         try:
             entry_type = software_sim[key_sim]["TYPE"]
         except KeyError:
-            if key_sim in ["SOFTWARE", "ID"]:
+            if key_sim in ["SOFTWARE", "ID", "SOURCE_FILES"]:
                 continue
             # That shouldn't happen! Unexpected YAML-keys were checked by
             # parse_valid_config_settings before
